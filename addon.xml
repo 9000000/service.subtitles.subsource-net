@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <addon id="service.subtitles.subsource-net"
        name="Subsource.net"
-       version="1.0.0"
+       version="1.0.1"
        provider-name="opensubtitles, subsource">
 	<requires>
 		<import addon="xbmc.python" version="3.0.0"/>
@@ -11,11 +11,13 @@
 	<extension point="xbmc.subtitle.module"
              library="service.py" />
 	<extension point="xbmc.addon.metadata">
-		<summary lang="en_GB">OpenSubtitles.com</summary>
+		<summary lang="en_GB">Subsource.net</summary>
 		<description lang="en_GB">Search and download subtitles for movies and TV-Series from subsource.net</description>
 		<news>
+v1.0.1 (2024-05-05)
+- Fix bugs and update latest api
 v1.0.0 (2024-05-4)
-Support subsource.com
+- Support subsource.com
 		</news>
 		<platform>all</platform>
 		<license>GPL-2.0-only</license>
