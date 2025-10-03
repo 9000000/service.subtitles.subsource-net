@@ -60,67 +60,70 @@ class SubtitleDownloader:
     def search(self, query=""):
         file_data = get_file_data(get_file_path())
         language_data = get_language_data(self.params)
-        subtitle_path = os.path.join(__temp__, f"{str(uuid.uuid4())}.{self.sub_format}")
 
-        # if there's query passed we use it, don't try to pull media data from VideoPlayer
         if query:
             media_data = {"query": query}
         else:
             media_data = get_media_data()
             if "basename" in file_data:
                 media_data["query"] = file_data["basename"]
-            log(__name__, "media_data '%s' " % media_data)
-
+            log(__name__, f"media_data '{media_data}'")
 
         try:
-            self.subtitles = self.open_subtitles.search_subtitles(media_data)
-        # TODO handle errors individually. Get clear error messages to the user
-        except (TooManyRequests, ServiceUnavailable, ProviderError, ValueError) as e:
-            error(__name__, 32001, e)
+            self.subtitles = self.open_subtitles.search_subtitles(media_data, language_data['languages'])
+        except TooManyRequests as e:
+            error(__name__, 32001, f"Too many requests: {e}")
+        except ServiceUnavailable as e:
+            error(__name__, 32001, f"Service unavailable: {e}")
+        except ProviderError as e:
+            error(__name__, 32001, f"Provider error: {e}")
+        except Exception as e:
+            error(__name__, 32001, f"An unexpected error occurred: {e}")
 
         if self.subtitles and len(self.subtitles):
-            log(__name__, len(self.subtitles))
+            log(__name__, f"Found {len(self.subtitles)} subtitles")
             self.list_subtitles()
         else:
-            # TODO retry using guessit???
-            log(__name__, "No subtitle found")
+            log(__name__, "No subtitles found")
+            xbmcgui.Dialog().notification(__addon__.getAddonInfo('name'), 'No subtitles found', xbmcgui.NOTIFICATION_INFO, 5000)
+
 
     def download(self):
-        valid = 1
         try:
-            self.file = self.open_subtitles.download_subtitle(
+            file_content = self.open_subtitles.download_subtitle(
                 {"file_id": self.params["id"], "sub_format": self.sub_format})
-        # TODO handle errors individually. Get clear error messages to the user
-            log(__name__, "XYXYXX download '%s' " % self.file)
-        except (TooManyRequests, ServiceUnavailable, ProviderError, ValueError) as e:
-            error(__name__, 32001, e)
-            valid = 0
 
-        subtitle_path = os.path.join(__temp__, f"{str(uuid.uuid4())}.{self.sub_format}")
-        log(__name__, "subtitle_path '%s' " % subtitle_path)
-        log(__temp__, "subtitle_path '%s' " % subtitle_path)
-        if (valid==1):
-            tmp_file = open(subtitle_path, "w" + "b")
-            tmp_file.write(self.file)
-            tmp_file.close()
-        
+            if not file_content:
+                raise ProviderError("Downloaded file is empty.")
 
-        list_item = xbmcgui.ListItem(label=subtitle_path)
-        xbmcplugin.addDirectoryItem(handle=self.handle, url=subtitle_path, listitem=list_item, isFolder=False)
+            subtitle_path = os.path.join(__temp__, f"{str(uuid.uuid4())}.{self.sub_format}")
+            log(__name__, f"subtitle_path '{subtitle_path}'")
 
-        return
+            with open(subtitle_path, "wb") as tmp_file:
+                tmp_file.write(file_content)
 
+            list_item = xbmcgui.ListItem(label=subtitle_path)
+            xbmcplugin.addDirectoryItem(handle=self.handle, url=subtitle_path, listitem=list_item, isFolder=False)
+
+        except (TooManyRequests, ServiceUnavailable, ProviderError) as e:
+            error(__name__, 32001, str(e))
+        except Exception as e:
+            error(__name__, 32001, f"An unexpected error occurred during download: {e}")
 
 
     def list_subtitles(self):
         if self.subtitles:
             for subtitle in self.subtitles:
-                language = convert_language(subtitle['lang'], True)
-                file_name = subtitle['releaseName']
-                list_item = xbmcgui.ListItem(label=language,
-                                             label2=file_name)
-                url = "plugin://" + __scriptid__ + "/?action=download&id=" + str(subtitle['subId'])
-                list_item.setArt({
-                    "thumb": "Ar"})
+                language = convert_language(subtitle.get('lang', ''), True)
+                file_name = subtitle.get('releaseName', 'Unknown')
+                list_item = xbmcgui.ListItem(label=language, label2=file_name)
+
+                url = f"plugin://{__scriptid__}/?action=download&id={subtitle.get('subId')}"
+
+                list_item.setArt({'thumb': get_flag(subtitle.get('lang', ''))})
+                list_item.setProperty("sync", "true" if subtitle.get('sync') else "false")
+                list_item.setProperty("hearing_imp", "true" if subtitle.get('hearingImpaired') else "false")
+
                 xbmcplugin.addDirectoryItem(handle=self.handle, url=url, listitem=list_item, isFolder=False)
+
         xbmcplugin.endOfDirectory(self.handle)
