@@ -91,7 +91,7 @@ class SubtitleDownloader:
     def download(self):
         try:
             file_content = self.open_subtitles.download_subtitle(
-                {"file_id": self.params["id"], "sub_format": self.sub_format})
+                {"id": self.params["id"]})
 
             if not file_content:
                 raise ProviderError("Downloaded file is empty.")
@@ -121,8 +121,8 @@ class SubtitleDownloader:
                 url = f"plugin://{__scriptid__}/?action=download&id={subtitle.get('subId')}"
 
                 list_item.setArt({'thumb': get_flag(subtitle.get('lang', ''))})
-                list_item.setProperty("sync", "true" if subtitle.get('sync') else "false")
-                list_item.setProperty("hearing_imp", "true" if subtitle.get('hearingImpaired') else "false")
+                list_item.setProperty("sync", subtitle.get('sync'))
+                list_item.setProperty("hearing_imp", subtitle.get('hearingImpaired'))
 
                 xbmcplugin.addDirectoryItem(handle=self.handle, url=url, listitem=list_item, isFolder=False)
 

@@ -1,169 +1,171 @@
-
-from typing import Union
-import zipfile
-import difflib
 import io
 import re
-import json
-from requests import Session, ConnectionError, HTTPError, ReadTimeout, Timeout, RequestException
-from resources.lib.exceptions import AuthenticationError, ConfigurationError, DownloadLimitExceeded, ProviderError, \
-    ServiceUnavailable, TooManyRequests, BadUsernameError
-from resources.lib.cache import Cache
+import zipfile
+import xbmcaddon
+from requests import Session, HTTPError, RequestException
+
+from resources.lib.exceptions import ProviderError, ServiceUnavailable, TooManyRequests
 from resources.lib.utilities import log
 
-API_URL = "https://api.subsource.net/api"
+API_URL = "https://api.subsource.net/api/v1"
+SEARCH_URL = f"{API_URL}/movies/search"
+GET_SUB_URL = f"{API_URL}/subtitles"
 
 def logging(msg):
     return log(__name__, msg)
 
 class SubtitlesProvider:
     def __init__(self):
-        self.request_headers = {
-            'accept': 'application/json, text/plain, */*',
-            'accept-language': 'en-US,en;q=0.9,vi;q=0.8',
-            'content-type': 'application/json',
-            'origin': 'https://subsource.net',
-            'priority': 'u=1, i',
-            'referer': 'https://subsource.net/',
-            'sec-ch-ua': '"Google Chrome";v="125", "Chromium";v="125", "Not.A/Brand";v="24"',
-            'sec-ch-ua-mobile': '?0',
-            'sec-ch-ua-platform': '"macOS"',
-            'sec-fetch-dest': 'empty',
-            'sec-fetch-mode': 'cors',
-            'sec-fetch-site': 'same-site',
-            'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
-            }
+        self.addon = xbmcaddon.Addon()
+        self.api_key = self.addon.getSetting('subsource.apikey')
         self.session = Session()
-        self.session.headers = self.request_headers
-        # Use any other cache outside of module/Kodi
-        self.cache = Cache(key_prefix="os_com")
+        self.session.headers.update({'X-API-Key': self.api_key})
 
-    def handle_request(self, url, data):
+    def _request(self, method, url, params=None, stream=False):
+        if not self.api_key:
+            raise ProviderError("Subsource API Key is missing.")
         try:
-            r = self.session.post(url, data=json.dumps(data))
+            r = self.session.request(method, url, params=params, timeout=10, stream=stream)
             r.raise_for_status()
-        except (ConnectionError, Timeout, ReadTimeout) as e:
-            raise ServiceUnavailable(f"Unknown Error, empty response: {e.status_code}: {e!r}")
+            if stream:
+                return r.content
+            return r.json()
         except HTTPError as e:
             status_code = e.response.status_code
             if status_code == 429:
-                raise TooManyRequests()
-            elif status_code == 503:
-                raise ProviderError(e)
+                raise TooManyRequests("Too many requests to Subsource API.")
+            elif status_code in [502, 503, 504]:
+                raise ServiceUnavailable(f"Subsource API is unavailable (status code: {status_code}).")
             else:
-                raise ProviderError(f"Bad status code: {status_code}")
-        return r.json()
+                logging(f"Subsource API request failed: {e.response.text}")
+                raise ProviderError(f"Subsource API error: {status_code}")
+        except RequestException as e:
+            logging(f"Subsource API request failed: {e}")
+            raise ServiceUnavailable(f"Could not connect to Subsource API: {e}")
 
     def parse_filename(self, filename):
         filename = re.sub(r'\[.*?\]', '', filename).strip()
         clean_name = re.sub(r'\.\d+p.*|\.(mkv|avi|mp4)$', '', filename)
         clean_name = re.sub(r'\(.*?\)', '', clean_name).strip()
         clean_name = re.sub(r'\.(?=[A-Z])', ' ', clean_name)
-        clean_name = re.sub(r'\.', ' ', clean_name)  # Replace remaining dots that might be separators
-        clean_name = re.sub(r'\s+', ' ', clean_name)  
+        clean_name = re.sub(r'\.', ' ', clean_name)
+        clean_name = re.sub(r'\s+', ' ', clean_name)
         year_match = re.search(r'\b(19[0-9]{2}|20[0-9]{2})\b', clean_name)
         year = year_match.group(0) if year_match else None
         series_match = re.search(r'S(\d+)E(\d+)', filename, re.IGNORECASE)
         if series_match:
-            type_content = 'TVSeries'
-            seasonIdx = int(series_match.group(1))
-            episodeIdx = int(series_match.group(2))
+            type_content = 'episode'
+            season = int(series_match.group(1))
+            episode = int(series_match.group(2))
             title = re.sub(r'\s*S\d+E\d+.*', '', clean_name[:year_match.start() if year_match else None]).strip()
             title = title.rstrip('.').rstrip()
         else:
-            type_content = 'Movie'
-            seasonIdx = None
-            episodeIdx = None
+            type_content = 'movie'
+            season = None
+            episode = None
             title = clean_name[:year_match.start()].strip().rstrip('.') if year_match else clean_name.rstrip('.')
 
         return {
             "title": title,
             "year": year,
             "type": type_content,
-            "season_number": seasonIdx,
-            "episode_number": episodeIdx
+            "season": season,
+            "episode": episode
         }
 
     def search_subtitles(self, media_data: dict, languages: str):
-        metadata = self.parse_filename(media_data['query'])
-        logging(f"Parsed Metadata: {metadata}")
+        if 'query' in media_data and ('title' not in media_data or not media_data['title']):
+            parsed_data = self.parse_filename(media_data['query'])
+            parsed_data['query'] = media_data['query']
+            media_data = parsed_data
 
-        data = {'query': metadata['title']}
-        ep_index = None
-        if metadata['type'] == 'TVSeries':
-            ep_index = f"S{metadata['season_number']:02d}E{metadata['episode_number']:02d}"
-            logging(f"Ep index: {ep_index}")
+        is_tvshow = media_data.get('type') in ['episode', 'tvshow']
+        query_title = media_data.get('tvshowtitle') or media_data.get('title', '')
+        year = media_data.get('year', '')
 
-        response = self.handle_request(API_URL + "/searchMovie", data=data)
-        logging(f"Search response: {response}")
+        search_params = {
+            "searchType": "text",
+            "q": query_title,
+            "year": year,
+            "type": "tvseries" if is_tvshow else "movie"
+        }
 
-        if not response.get('success'):
-            logging("No successful response from searchMovie API.")
-            return None
+        logging(f"Searching Subsource with params: {search_params}")
+        search_results = self._request("GET", SEARCH_URL, params=search_params)
+
+        if "error" in search_results:
+            logging(f"Subsource API error: {search_results.get('message')}")
+            return []
+
+        found_movies = search_results.get("data", [])
+        if not found_movies:
+            logging("No movies found on Subsource for the query.")
+            return []
+
+        movie_id = None
+        first_season_id = None
+        for res in found_movies:
+            if is_tvshow:
+                if res.get("season") == 1:
+                    first_season_id = res.get("movieId")
+                if str(res.get("season")) == str(media_data.get("season")):
+                    movie_id = res.get("movieId")
+                    break
+            else:
+                movie_id = res.get("movieId")
+                break
+
+        target_movie_id = movie_id or first_season_id
+        if not target_movie_id:
+            logging("Could not determine a movie ID from Subsource search results.")
+            return []
+
+        logging(f"Found movie ID: {target_movie_id}")
+        sub_params = {"movieId": target_movie_id, "language": languages.lower()}
+        subs_data = self._request("GET", GET_SUB_URL, params=sub_params)
+
+        if not subs_data.get("success"):
+            logging("Failed to get subtitles from Subsource.")
+            return []
 
         all_subtitles = []
-        for item in response.get('found', []):
-            logging(f"Item: {item}")
-            if self.is_match_item(item, metadata):
-                logging(f"Matched Item: {item}")
-                data = {'movieName': item['linkName']}
-                if metadata['type'] == 'TVSeries':
-                    data['season'] = f"season-{metadata['season_number']}"
+        for result in subs_data.get("data", []):
+            release_name = result.get("releaseInfo", [""])[0]
+            if is_tvshow:
+                season_ep = f"S{int(media_data.get('season', '0')):02d}E{int(media_data.get('episode', '0')):02d}"
+                if season_ep not in release_name:
+                    continue
 
-                get_movie_response = self.handle_request(API_URL + "/getMovie", data=data)
-                logging(f"Get movie response: {get_movie_response}")
+            sync = "true" if media_data.get('query') and media_data.get('query') in release_name else "false"
+            sub = {
+                'lang': result.get("language", "").capitalize(),
+                'releaseName': release_name,
+                'subId': result.get("subtitleId"),
+                'sync': sync,
+                'hearingImpaired': "true" if result.get("hearingImpaired") else "false",
+            }
+            all_subtitles.append(sub)
 
-                if get_movie_response.get('success') and 'subs' in get_movie_response:
-                    subtitles = self.filter_subs_by_language_and_epindex(get_movie_response['subs'], languages, ep_index)
-                    logging(f"Filtered Subtitles: {subtitles}")
-                    all_subtitles.extend(subtitles)
-                else:
-                    logging(f"Failed to get movie details or no subs found for {item['linkName']}.")
-
-        if not all_subtitles:
-            logging("No matching subtitles found.")
-            return None
-
+        logging(f"Found {len(all_subtitles)} subtitles from Subsource.")
         return all_subtitles
 
-    def filter_subs_by_language_and_epindex(self, subs_list, target_languages, ep_index=None):
-
-        target_languages_list = target_languages.split(',')
-
-        if ep_index:
-            return [sub for sub in subs_list if sub['lang'] in target_languages_list and ep_index in sub['releaseName']]
-        else:
-            return [sub for sub in subs_list if sub['lang'] in target_languages_list]
-
-    def is_match_item(self, item, metadata):
-        return self.is_match_year(item, metadata) and self.is_match_title(item['title'], metadata['title'])
-
-    def is_match_year(self, item, metadata):
-        return metadata['year'] is None or str(item.get('releaseYear')) == metadata['year']
-
-    def is_match_title(self, query, title):
-        return difflib.SequenceMatcher(None, query, title).ratio() > 0.7
-
     def download_subtitle(self, query: dict):
-        data = {"id": query["file_id"]}
-        download_link = API_URL + "/downloadSub"
-        res = self.session.post(url=download_link, data=json.dumps(data))
-        res.raise_for_status()
+        subtitle_id = query["id"]
+        download_url = f"{GET_SUB_URL}/{subtitle_id}/download"
+        logging(f"Downloading subtitle from: {download_url}")
 
         try:
-            response_data = res.json()
-            if response_data.get("success") and response_data.get("link"):
-                download_url = response_data["link"]
-                subtitle_res = self.session.get(download_url)
-                subtitle_res.raise_for_status()
-
-                with zipfile.ZipFile(io.BytesIO(subtitle_res.content)) as z:
-                    file_name = z.namelist()[0]
-                    file_content = z.read(file_name)
-                return file_content
-            else:
-                raise ProviderError("Failed to get download link from API.")
-        except (zipfile.BadZipFile, KeyError, IndexError) as e:
-            logging(f"Failed to handle subtitle download response: {e}")
-            raise ProviderError(f"Failed to handle subtitle download: {e}")
-    
+            zipped_content = self._request("GET", download_url, stream=True)
+            with zipfile.ZipFile(io.BytesIO(zipped_content)) as z:
+                subtitle_filename = z.namelist()[0]
+                file_content = z.read(subtitle_filename)
+            return file_content
+        except zipfile.BadZipFile as e:
+            logging(f"Failed to unzip downloaded file: {e}")
+            raise ProviderError("Downloaded file is not a valid zip file.")
+        except IndexError:
+            logging("Downloaded zip file is empty.")
+            raise ProviderError("Downloaded zip file is empty.")
+        except Exception as e:
+            logging(f"An unexpected error occurred during download: {e}")
+            raise ProviderError(f"An unexpected error occurred during download: {e}")
